@@ -1,0 +1,194 @@
+---
+title: "Performance Machine Learning"
+subtitle: "An analysis on using wearables to predict level of performance"
+date: "16 February 2016"
+output:
+  html_document:
+    toc: true
+    #number_sections: true
+    css: custom.css
+    theme: spacelab # "default", "cerulean", "journal", "flatly",
+                    #  "readable", "spacelab", "united", "cosmo", "lumen", "paper",                                      #  "sandstone",  "simplex", or "yeti")
+    highlight:  pygment #  “default”, “tango”, “pygments”, “kate”, 
+                         # “monochrome”, “espresso”, “zenburn”, “haddock”,
+                         # “textmate”
+references:
+- id: velloso2013a
+  title: Qualitative Activity Recognition of Weight Lifting Exercises
+  author: 
+  - family: Velloso, E
+  - family: Bulling, A.
+  - family: Gellersen, H.
+  - family: Ugulino, W.
+  - family: Fuks, H.
+  container-title: Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) 
+  URL: 'http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf'
+  publisher: ACM SIGCHI
+  issued:
+    year: 2013
+---
+
+    
+
+``` {r load_data, echo=F, results='hide', message=F, warning=F, cache=T}
+library(knitr)
+library(caret)
+library(randomForest)
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(caret)
+data_dir <- "~/coursera/datasciencecoursera/courses/8.- Practical Machine Learning/project/final"
+setwd(data_dir)
+data_path="../data"
+training_file <- "pml-training.csv"
+testing_file <- "pml-testing.csv"
+na_strings <-  c("NA", "#DIV/0!")
+training <- data.table(read.csv(paste(data_path, training_file, sep="/"),
+                                na.strings=na_strings))
+testing <- data.table(read.csv(paste(data_path, testing_file, sep="/"), 
+                               na.strings=na_strings))
+
+```
+
+## Summary
+
+One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it.
+
+In this project, the goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants, as described in paper  Qualitative Activity Recognition of Weight Lifting Exercises [@velloso2013a], to train a random forest model capable of predict wheter the exercise in being realized in the correct way, or fall in one of the typified error classes.
+
+## 1. Data Overview
+
+``` {r data_cleaning, echo=F, results="hide", cache = T}
+na_values <- function(x) {
+  conts <- list()
+  cols <- colnames(x)
+  for (col in cols) {
+    conts <- c(conts, sum(is.na(x[[col]])))
+  }
+  data.table(col=cols, na_cont=as.numeric(conts))
+}
+nadt <- na_values(training)
+```
+
+```{r data_overview, cache = T, tidy=T, tidy.opts=list(width.cutoff=200)}
+dim(training)
+table(nadt$na_cont)
+```
+
+```{r remove_na_cols, echo=F, cache = T}
+training <- subset(training, T,nadt[na_cont == 0]$col)
+nzvar <- nearZeroVar(training, saveMetrics= TRUE)
+```
+The dataset contains 160 columns, but a great number of them (`r sum(nadt$na_cont>0)`) contains mostly (more than `r round(min(nadt$na_cont[nadt$na_cont>0]) / nrow(training)*100,2)`% of rows) "NA" or "#DIV/0!" values, so we will remove before any other action is taken. After that, we check for near zero variance predictors, removing `r sum(nzvar$nzv==T)` additional variables. 
+
+```{r near_zero_variance, echo=F, results="hide", cache = T}
+training <- subset(training, T,nadt[na_cont == 0]$col)
+nzvar <- nearZeroVar(training, saveMetrics= TRUE)
+#remove columns with near zero variance
+training <- training[,c(row.names(nzvar[nzvar$nzv==T,])):=NULL]
+```
+
+## 2. Feature selection
+
+First, we remove the variables that are related to the specific metodology of the data gathering (such as user_name, row id, window information and timestamp related info), as we want to try to fit the random forest with the minimal information about the subject and, being the "classe" outcome ordered in alphabetical order, sequences have a clear relation with the outcome, but wont be realistic in any other type of sample data.
+
+``` {r training_average_set, echo=F, results="hide", cache = T}
+# removing time series, row ID, num_window, and user related columns
+ts_columns <- c("raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp")
+training_avg <- data.table(training)
+training_avg <- training_avg[,c(ts_columns):=NULL]
+training_avg <- data.table(aggregate(. ~ user_name + num_window + classe,FUN=mean, data=training))
+ts_columns <- c("X", "user_name","num_window")
+training_avg <- training_avg[,c(ts_columns):=NULL]
+M_avg <- cor(subset(training_avg, T, c(colnames(training_avg)[2:(ncol(training_avg))])))
+```
+
+``` {r removing_paper_variables, echo=F, results="hide", cache = T}
+# removing time series, row ID, num_window, and user related columns
+ts_columns <- c("X", "user_name","num_window","raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp")
+training <- training[,c(ts_columns):=NULL]
+M <- cor(subset(training, T, c(colnames(training)[1:(ncol(training)-1)])))
+```
+
+```{r correlated,echo=F, results="hide", cache = F, message=F, warning=F}
+#removing high correlated
+library(caret)
+library(data.table)
+cut_off <- .85
+set.seed(12121)
+highCorr <- findCorrelation(M, cutoff = cut_off, names = T)
+training <- training[,c(highCorr):=NULL]
+```
+
+As next step, we check the correlation of the remaining variables, finding that there are `r length(highCorr)` highly correlated variables (cor > `r cut_off`), as can be seen in the plot below:
+
+```{r corr_plot, echo=F, cache = T, message=F, warning=F}
+library(corrplot)
+corrplot(M, order = "hclust", tl.cex=.3, hclust.method = "centroid")
+``` 
+
+## 3. Training the model
+
+As already stated, we agree with the original authors of the paper [@velloso2013a] that the random forest should probably perform quite well on this classification problem, so we use caret package to extract a train index for only half of the observations, that will allow to have a quite large remaining set to be used as validation set. A cross validation on 10 folders is set as trainControl method to reduce bias in sample selecction. 
+
+``` {r model_training, echo=F, results="hide", cache=T}
+trainIndex<-createDataPartition(training$classe)
+to_integer <- function(x) {r=integer();for (i in x) {r<-c(r,i)};r}
+trainIndex<-to_integer(trainIndex)
+train_control <- trainControl(method="cv", number=10)
+rf <- train(classe~.,training[trainIndex], type="rf",trControl=train_control)
+save(rf,trainIndex, file="random_forest.RData")
+importance <- data.table(rownames(rf$finalModel$importance), rf$finalModel$importance)
+```
+
+``` {r model_training_avg, echo=F, results="hide", cache=T}
+to_integer <- function(x) {r=integer();for (i in x) {r<-c(r,i)};r}
+trainIndex_avg<-to_integer(createDataPartition(training_avg$classe))
+# use 10 folder cross validation
+train_control <- trainControl(method="cv", number=10)
+rf_avg <- train(classe~.,training_avg[trainIndex_avg], type="rf",trControl=train_control)
+importance_avg <- data.table(rownames(rf_avg$finalModel$importance),rf_avg$finalModel$importance)
+```
+
+The final random forest uses `r rf$bestTune` variables in its best tune. For further information, the R model dump can be downloaded from this link: <a href="./random_rofest.RData">Download Ranfom Forest Model</a>
+
+```{r}
+plot(rf)
+```
+
+``` {r validation, message=F, echo=F}
+cm <- confusionMatrix(predict(rf,training[-trainIndex]), training[-trainIndex]$classe)
+```
+
+``` {r validation_avg, message=F, echo=F}
+cm_avg <- confusionMatrix(predict(rf_avg, training_avg[-trainIndex_avg]), training_avg[-trainIndex_avg]$classe)
+```
+
+The prediction for the half of the data set that was not used in training has an accuracy of `r round(cm$overall[1]*100,2)`%. The confusion matrix shows that sensiviy and specificity for class "A" (exercises done in the proper way) are greater than `r round(min(cm$byClass[1,1:2])*100,2)`%, and a balanced accuracy of 99.77%. Simmilarly, performance indicators for error type classes have also very high values.
+
+<span>
+<div style="font-size: small;margin-top: 19px;float: left;">
+   `r library(knitr);kable(cm$table);`
+</div>
+<style>.byClass td {min-width: 60px;} .table {border: solid 1px lightgrey}</style>
+<div class="byClass" style="margin-left: 5%;float: left;margin: 0 3% 2px 2%;font-size: small;min-width: 60px;max-width: 70%;">
+   `r library(knitr);kable(cm$byClass);`
+</div>
+</span>
+
+
+It seems that the trained model can predict with an outstanding accuracy, although it is known the tendence of the random forests to overfit, so it could be expected worse accuracy levels when new people exercises are classified with this model.
+
+
+## 4. Prediction
+
+Using the model to predict the class for the pml-testing dataset we get the following values:
+
+``` {r prediction}
+predict(rf,testing)
+```
+
+
+## 5. References
+<nbsp>
